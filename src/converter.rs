@@ -9,6 +9,15 @@ use crate::utils;
 /// 图像转换器，提供各种格式间的转换功能
 pub struct ImageConverter;
 
+enum ImageType {
+    SimpleGraphics, // 简单图形
+    HorizontalGraphics, // 水平渐变
+    VerticalPattern, // 垂直模糊
+    SmoothPhoto, // 平滑照片
+    ComplexGeometry, // 复杂几何
+    Mixed // 混合内容，使用自适应过滤器
+}
+
 impl ImageConverter {
     /// 创建新的图像转换器实例
     pub fn new() -> Self {
@@ -111,17 +120,88 @@ impl ImageConverter {
         
         let (width, height) = (img.width(), img.height());
         let color_type = img.color();
+        let image_type = self.analyze_image_type(&img);
 
         match target_format.to_lowercase().as_str() {
             "jpeg" | "jpg" => self.convert_to_jpeg(&img, output, quality)?,
             "webp" => self.convert_to_webp(&img, output, quality)?,
-            "png" => self.convert_to_png(&img, output, quality, color_type)?,
+            "png" => self.convert_to_png(&img, output, quality, image_type, color_type)?,
             "gif" => self.convert_to_gif(&img, output)?,
             "ico" => self.convert_to_ico(&img, output, width, height)?,
             _ => anyhow::bail!("不支持的目标格式: {}", target_format),
         }
         
         Ok(())
+    }
+
+    /// 分析图像类型
+    fn analyze_image_type(&self, img: &image::DynamicImage) -> ImageType {
+        let (width, height) = (img.width(), img.height());
+
+        // 小尺寸图像通常是图标或者简单图形
+        if width <= 64 && height <= 64 {
+            return ImageType::SimpleGraphics;
+        }
+
+        // 分析图像变化模式
+        let sample_size = (width.min(height) / 4).max(10) as usize;
+        let rgba_img = img.to_rgba8();
+
+        let mut horizontal_variation = 0u64;
+        let mut vertical_variation = 0u64;
+        let mut sample_count = 0u32;
+
+        // 采样分析水平和垂直方向的变化
+        for y in (0..height).step_by((height as usize / sample_size).max(1)) {
+            for x in (1..width).step_by((width as usize / sample_size).max(1)) {
+                if let Some(current) = rgba_img.get_pixel_checked(x, y) {
+                    if let Some(left) = rgba_img.get_pixel_checked(x - 1, y) {
+                        horizontal_variation += Self::pixel_difference(current, left) as u64;
+                        sample_count += 1;
+                    }
+                }
+            }
+        }
+
+        for y in (1..height).step_by((height as usize / sample_size).max(1)) {
+            for x in (0..width).step_by((width as usize / sample_size).max(1)) {
+                if let Some(current) = rgba_img.get_pixel_checked(x, y) {
+                    if let Some(up) = rgba_img.get_pixel_checked(x, y - 1) {
+                        vertical_variation += Self::pixel_difference(current, up) as u64;
+                    }
+                }
+            }
+        }
+
+        if sample_count == 0 {
+            return ImageType::SimpleGraphics;
+        }
+
+        let avg_horizontal = horizontal_variation / sample_count as u64;
+        let avg_vertical = vertical_variation / sample_count as u64;
+
+        // 根据方向性变化选择类型
+        if avg_horizontal < avg_vertical / 2 {
+            ImageType::HorizontalGraphics
+        } else if avg_vertical < avg_horizontal / 2 {
+            ImageType::VerticalPattern
+        } else if avg_horizontal < 10 && avg_vertical < 10 {
+            ImageType::SmoothPhoto
+        } else if avg_horizontal > 50 && avg_vertical > 50 {
+            // 高变化率的复杂内容使用自适应过滤器
+            ImageType::Mixed
+        } else {
+            ImageType::ComplexGeometry
+        }
+    }
+
+    /// 计算两个像素间的差异
+    fn pixel_difference(p1: &image::Rgba<u8>, p2: &image::Rgba<u8>) -> u32 {
+        let r_diff = (p1[0] as i32 - p2[0] as i32).abs() as u32;
+        let g_diff = (p1[1] as i32 - p2[1] as i32).abs() as u32;
+        let b_diff = (p1[2] as i32 - p2[2] as i32).abs() as u32;
+        let a_diff = (p1[3] as i32 - p2[3] as i32).abs() as u32;
+        r_diff + g_diff + b_diff + a_diff
     }
     
     /// 转换为JPEG格式
@@ -159,23 +239,40 @@ impl ImageConverter {
         img: &image::DynamicImage, 
         output: &Path, 
         quality: u8,
+        image_type: ImageType,
         color_type: ColorType
     ) -> Result<()> {
         let output_file = File::create(output)
             .with_context(|| format!("无法创建输出文件: {}", output.display()))?;
 
+        let filter_type = self.get_optimal_filter_type(image_type);
+
         // 根据质量参数调整PNG压缩级别
         let compression_level = self.get_png_compression_level(quality);
         let encoder = PngEncoder::new_with_quality(
             output_file, 
-            compression_level, 
-            image::codecs::png::FilterType::Adaptive
+            compression_level,
+            filter_type
         );
 
         // 保持原有颜色类型以避免不必要的转换
         self.encode_png_with_optimal_color_type(img, encoder, color_type)?;
         
         Ok(())
+    }
+
+    /// 根据图像类型选择最优过滤器
+    fn get_optimal_filter_type(&self, image_type: ImageType) -> image::codecs::png::FilterType {
+        use image::codecs::png::FilterType;
+
+        match image_type {
+            ImageType::SimpleGraphics => FilterType::NoFilter,
+            ImageType::HorizontalGraphics => FilterType::Sub,
+            ImageType::VerticalPattern => FilterType::Up,
+            ImageType::SmoothPhoto => FilterType::Avg,
+            ImageType::ComplexGeometry => FilterType::Paeth,
+            ImageType::Mixed => FilterType::Adaptive
+        }
     }
     
     /// 转换为GIF格式
